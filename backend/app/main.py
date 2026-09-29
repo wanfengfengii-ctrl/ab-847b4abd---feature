@@ -33,6 +33,15 @@ def audit_schema() -> dict[str, object]:
             "tau_open": "箱盖开启热惯性时间常数（秒，>0）",
             "box_temp_limit": "允许箱温阈值（数值，严格超限 T>limit 计暴露）",
             "exposure_limit_seconds": "允许连续暴露时长（秒，>0）",
+            "recool": {
+                "_note": "可选；缺省或 enabled=false 时沿用原裁决口径，原请求/结论/证据不变",
+                "enabled": "是否启用“复冷记忆”（布尔）",
+                "recool_threshold": "复冷阈值（数值，必须严格低于 box_temp_limit）",
+                "confirm_seconds": "连续不高于复冷阈值的确认时长（秒，>0），达到才清零并开始新一轮",
+                "_rule": "T>限温累计暴露；复冷阈值<T<=限温只暂停累计并保留本轮记忆；"
+                "连续 T<=复冷阈值达到确认时长才清零；短暂回暖或结束未确认不清零，"
+                "后段超温与此前未清除暴露累计，达到限额即拒收",
+            },
         },
     }
 

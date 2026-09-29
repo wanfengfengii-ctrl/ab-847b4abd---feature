@@ -43,6 +43,26 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
 
 > 生产裁决路径不含任何数值积分；仓库中的 RK4 参考实现仅用于测试交叉验证。
 
+### 复冷记忆（可选，质控员在审计页启用）
+
+岸基实验室发现：短暂回落到限温下方并不足以让油样恢复稳定。因此审计页可选启用
+**“复冷记忆”**，填写**复冷阈值**（必须严格低于原限温）与**确认时长**。启用后按
+全程事件顺序推进：
+
+- 箱温 **高于原限温**（T > T_limit）时累计热暴露；
+- 处于**复冷阈值与限温之间**（rc < T ≤ T_limit）时**只暂停累计并保留本轮记忆**；
+- 只有**连续不高于复冷阈值**（T ≤ rc）**达到确认时长**才清零并开始新一轮；
+- **短暂回暖打断**或**数据结束时仍未确认**都不清零，后段超温与此前未清除暴露
+  同轮累计；累计达到限额即**拒收**，并指明**此前哪次复冷不足**以及失效发生的
+  **解析时刻**。
+
+两道阈值的穿越点与确认完成时刻仍由逐段闭式曲线精确定位（二分求根，容差 1e-12s），
+状态机沿切分后的区域恒定（超温/暂停带/复冷）子区间推进，**不按展示采样点裁决**，
+也不割裂跨记录或短暂回暖的同一轮暴露。**未启用时原请求、结论及证据完全不变。**
+
+页面与接口据此额外展示：每轮起止与热暴露累计、复冷候选区间及其清零/中断原因、
+清零事件、未被清除的累计暴露，以及绑定到具体复冷不足尝试的首个失效时刻。
+
 ### 关键业务场景（拒收演示数据）
 
 录入读数全部低于 8℃：`4.0 / 7.81 / 7.25 / 3.21 / 3.01 ℃`，
@@ -93,16 +113,62 @@ T'(s) = b − (T_i − a + b·τ)/τ · exp(−s/τ)
     "tau_closed": 300,
     "tau_open": 90,
     "box_temp_limit": 8.0,
-    "exposure_limit_seconds": 600
+    "exposure_limit_seconds": 600,
+    "recool": {
+      "enabled": true,
+      "recool_threshold": 4.0,
+      "confirm_seconds": 600
+    }
   }
 }
 ```
 
+- `recool` 为**可选对象**：缺省、`enabled:false` 或缺字段时沿用原裁决口径，
+  响应与旧版完全一致（不含 `recool` 块）。启用时 `recool_threshold` 必须是
+  **严格低于** `box_temp_limit` 的有限数，`confirm_seconds` 必须 > 0；不合法返回 422。
 - `time`：全表统一使用 **ISO 8601 字符串**（朴素时间按 UTC 解释，回显统一 UTC）
   或**数值纪元秒**，不得混用；必须严格递增；记录数 4–30。
 - 成功返回 `200`，`status` 为 `pass`（放行）或 `reject`（拒收）。
 - 数据不合法返回 `422`：`{"status":"invalid","verdict":"数据不合法","errors":[...]}`；
   非法 JSON / 非对象请求体返回 `400`。
+
+启用复冷记忆时，响应在保留原字段（`exceedance_intervals`、`first_failure_time` 等，
+供新旧口径对照）之外，新增 `recool` 证据块：
+
+```json
+{
+  "status": "reject",
+  "first_failure_time": {"time": 1580.339, "elapsed_seconds": 1580.339,
+    "round_index": 0, "round_start_elapsed_seconds": 100.357,
+    "cumulative_exposure_seconds": 600.0,
+    "insufficient_recool_candidate_index": 0},
+  "recool": {
+    "enabled": true, "recool_threshold": 4.0, "confirm_seconds": 600.0,
+    "rounds": [
+      {"index": 0, "start_time": 100.357, "end_time": 1580.339,
+       "hot_exposure_seconds": 678.8, "reset": false, "failed": true,
+       "failure_elapsed_seconds": 1580.339}
+    ],
+    "recool_candidates": [
+      {"index": 0, "start_time": 496.854, "end_time": 1071.636,
+       "duration_seconds": 574.78, "confirmed": false,
+       "status": "rewarmed", "cleared_at": null,
+       "status_text": "复冷确认完成前短暂回暖……本轮暴露保留"}
+    ],
+    "resets": [],
+    "uncleared_cumulative_exposure_seconds": 600.0,
+    "insufficient_recool": {"candidate_index": 0, "reason": "rewarmed",
+      "round_index": 0, "interrupted_time": 1071.636}
+  }
+}
+```
+
+- `rounds`：每轮自首次超温起的账，含起止、热暴露累计、是否清零 / 拒收时刻；
+- `recool_candidates`：每次连续 `T≤复冷阈值` 的候选区间，`status` 为
+  `confirmed`（达到确认时长，清零）/ `rewarmed`（回暖打断，复冷不足）/
+  `observation_ended`（结束未确认）；`resets` 为清零事件；
+- 拒收时 `first_failure_time` 与 `recool.insufficient_recool` 共同指出**累计达标的
+  解析时刻**与**此前哪次复冷不足**。
 
 拒收响应的核心证据字段：
 
@@ -172,10 +238,14 @@ docker inspect <verify容器> --format '{{.State.ExitCode}}'
 
 ## 6. 前端页面
 
-- 左侧录入 4–30 条记录与四个模型参数，内置三套预设：
-  **拒收（读数全合格、途中升温）/ 放行 / 短时超温不足时长**；
-- 右侧展示结论徽章、最早失效时刻证据卡；
+- 左侧录入 4–30 条记录与四个模型参数，内置五套预设：
+  **拒收（读数全合格、途中升温）/ 放行 / 短时超温不足时长**，以及
+  **复冷记忆·拒收（复冷不足、累计达限）/ 复冷记忆·放行（有效复冷清零）**；
+- 可勾选**③ 启用“复冷记忆”**并填写复冷阈值与确认时长（未启用时原口径不变）；
+- 右侧展示结论徽章、最早失效时刻证据卡（启用复冷时含归咎的复冷不足尝试）；
 - SVG 连续曲线图：箱温闭式曲线、环境温线性线、允许箱温阈值、
+  （启用时）复冷阈值线与复冷候选区间底色/清零时刻、
   超温区间红色遮罩、箱盖开启时段底色、录入读数空心点、最早失效竖线；
-- 表格列出**累计连续超温区间**（起止时刻、持续时长、是否达到限额）
-  与**各段解析极值 / 阈值穿越方向与时刻**。
+- 启用复冷时表格列出**每轮起止与热暴露累计**、**复冷候选区间及清零/中断原因**；
+  另保留原口径**累计连续超温区间**表供新旧对照，
+  以及**各段解析极值 / 两道阈值穿越方向与时刻**。

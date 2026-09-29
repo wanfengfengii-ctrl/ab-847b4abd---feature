@@ -154,3 +154,35 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
   color: var(--muted); font-size: 12px; line-height: 1.7; margin-bottom: 16px;
 }
 .model-note code { color: var(--accent); }
+
+/* 复冷记忆 */
+.recool-box {
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin: 12px 0 4px;
+  background: rgba(77, 163, 255, 0.04);
+}
+.recool-box.on {
+  border-style: solid;
+  border-color: var(--accent);
+  background: rgba(77, 163, 255, 0.08);
+}
+.recool-head {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 600; font-size: 13px; margin-bottom: 0;
+}
+.recool-head input { width: auto; }
+.recool-body { margin-top: 10px; }
+.recool-box:not(.on) .recool-body { opacity: 0.55; }
+
+.recool-panel {
+  border: 1px solid #2b5d87;
+  background: rgba(77, 163, 255, 0.06);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin: 6px 0 4px;
+}
+.tag.confirmed { background: rgba(46,204,113,0.2); color: var(--pass); }
+.tag.rewarmed { background: rgba(77,163,255,0.2); color: var(--accent); }
+.tag.ended { background: rgba(147,164,161,0.15); color: var(--muted); }
