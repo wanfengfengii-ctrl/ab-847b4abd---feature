@@ -398,3 +398,256 @@ def test_curve_covers_entire_timeline():
     res = run(recs)
     assert res["curve"][0]["elapsed_seconds"] == 0
     assert res["curve"][-1]["elapsed_seconds"] == 1500
+
+
+# ---------- 复冷记忆 ----------
+
+# 恒温相位场景（相邻同温记录 + 1 秒过渡，tau=300, limit=8, recool=5）：
+#   H1（T>8）        ≈ 63.4–200.5 ，热暴露 137.1s
+#   C1（T<=5）       ≈ 475.4–1125.7，连续 650.3s
+#   H2               ≈ 1174.4–1500 ，热暴露 325.6s
+# 旧口径：两个超温区间各自 <400s → 放行。
+RECOOL_TIMES = [0, 100, 101, 1100, 1101, 1500]
+RECOOL_AMBS = [25.0, 25.0, 3.0, 3.0, 25.0, 25.0]
+
+
+def recool_records():
+    return make_records_from_sim(RECOOL_TIMES, RECOOL_AMBS, [False] * 6, 4.0, TAU_CLOSED, TAU_OPEN)
+
+
+def test_disabled_recooling_keeps_legacy_shape():
+    res = run(recool_records(), exposure_limit_seconds=400)
+    assert res["status"] == "pass"  # 旧口径：两段各自不足
+    assert "recooling" not in res  # 未启用时请求、结论及证据保持不变
+
+
+def test_recooling_default_when_key_absent_equals_legacy():
+    payload = {"records": recool_records(), "parameters": params(exposure_limit_seconds=400)}
+    assert audit(payload)["status"] == "pass"
+
+
+def test_effective_recool_clears_memory_and_passes():
+    res = audit(
+        {
+            "records": recool_records(),
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 600.0},
+        }
+    )
+    assert res["status"] == "pass"
+    assert res["first_failure_time"] is None
+    blk = res["recooling"]
+    assert blk["enabled"] is True
+    # 第 0 轮：137.1s 暴露，在连续复冷确认完成时清零
+    r0, r1 = blk["rounds"]
+    assert r0["end_reason"] == "recool_confirmed"
+    assert r0["reset"] is True
+    assert r0["heat_exposure_seconds"] == pytest.approx(137.1, abs=0.5)
+    assert r1["end_reason"] == "timeline_end"
+    assert r1["heat_exposure_seconds"] == pytest.approx(325.6, abs=0.5)
+    # 唯一候选达到确认：完成时刻 = 候选起点 + 600
+    cand = blk["candidates"][0]
+    assert cand["outcome"] == "recool_confirmed"
+    assert cand["reset"] is True
+    assert cand["shortfall_seconds"] == 0
+    assert cand["elapsed_end_seconds"] - cand["elapsed_start_seconds"] == pytest.approx(600, abs=1e-6)
+
+
+def test_insufficient_recool_accumulates_and_rejects_later():
+    res = audit(
+        {
+            "records": recool_records(),
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 700.0},
+        }
+    )
+    # 复冷只有 650.3s（<700），未清零：137.1 + 325.6 累计达 400 → 后段拒收
+    assert res["status"] == "reject"
+    ff = res["first_failure_time"]
+    # 失效时刻 = H2 起点 1174.4 + (400-137.1)
+    assert ff["elapsed_seconds"] == pytest.approx(1174.4 + 262.9, abs=1.0)
+    assert ff["round_index"] == 0  # 同一轮延续到后段
+    assert ff["segment_index"] == 4  # 失效发生在第 5 段（H2 所在段，0 基）
+    cand = res["recooling"]["insufficient_recool_at_failure"]
+    assert cand is not None
+    assert cand["index"] == 0
+    assert cand["reset"] is False
+    assert cand["outcome"] == "rewarm_above_recool"
+    assert cand["shortfall_seconds"] == pytest.approx(49.7, abs=1.0)
+    assert cand["continuous_below_recool_seconds"] == pytest.approx(650.3, abs=1.0)
+    # 轮次：仅有一轮，以 failure 收尾，热暴露精确为限额
+    assert len(res["recooling"]["rounds"]) == 1
+    rd = res["recooling"]["rounds"][0]
+    assert rd["end_reason"] == "failure"
+    assert rd["heat_exposure_seconds"] == pytest.approx(400, abs=1e-6)
+
+
+def test_interrupted_confirm_by_middle_band_does_not_reset():
+    # 冷区被一次停留在 (5,8] 复冷阈值与限温之间的回暖打断：
+    # 即使两段冷区之和超过确认时长，也不能清零。
+    times = [0, 100, 101, 1100, 1101, 1141, 1142, 1900]
+    ambs = [25.0, 25.0, 3.0, 3.0, 25.0, 25.0, 3.0, 3.0]
+    recs = make_records_from_sim(times, ambs, [False] * 8, 4.0, TAU_CLOSED, TAU_OPEN)
+    res = audit(
+        {
+            "records": recs,
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 700.0},
+        }
+    )
+    cands = res["recooling"]["candidates"]
+    assert len(cands) == 2
+    assert all(c["reset"] is False for c in cands)
+    assert cands[0]["outcome"] == "rewarm_above_recool"
+    assert cands[1]["outcome"] == "timeline_end"
+    # 每段单独不足 700；不存在清零轮
+    assert all(r["end_reason"] != "recool_confirmed" for r in res["recooling"]["rounds"])
+    # 回暖期间 T 未超过限温：不产生新的超温区间
+    assert len(res["exceedance_intervals"]) == 1
+
+
+def test_recool_crossing_roots_are_accurate():
+    from app.thermal import _box_temperature
+
+    res = audit(
+        {
+            "records": recool_records(),
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 600.0},
+        }
+    )
+    crosses = [c for s in res["segments"] for c in s["recool_crossings"]]
+    assert {c["direction"] for c in crosses} == {"up", "down"}
+    # 在每个穿越根上以闭式解复核：箱温恰为复冷阈值
+    for seg in res["segments"]:
+        for c in seg["recool_crossings"]:
+            s = c["elapsed_seconds"] - seg["elapsed_start_seconds"]
+            val = _box_temperature(
+                s,
+                seg["box_temp_start"],
+                seg["ambient_start"],
+                seg["ambient_slope_per_second"],
+                seg["tau_seconds"],
+            )
+            assert abs(val - 5.0) < 1e-7
+
+
+def test_recooling_with_iso_times_matches_numeric():
+    from datetime import datetime, timezone
+
+    num = recool_records()
+    iso = [
+        {
+            **r,
+            "time": datetime.fromtimestamp(1_700_000_000 + r["time"], tz=timezone.utc).isoformat(),
+        }
+        for r in num
+    ]
+    cfg = {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 700.0}
+    r1 = audit({"records": num, "parameters": params(exposure_limit_seconds=400), "recooling": cfg})
+    r2 = audit({"records": iso, "parameters": params(exposure_limit_seconds=400), "recooling": cfg})
+    assert r1["status"] == r2["status"] == "reject"
+    assert (
+        r1["first_failure_time"]["elapsed_seconds"]
+        == r2["first_failure_time"]["elapsed_seconds"]
+    )
+    assert isinstance(r2["recooling"]["candidates"][0]["start_time"], str)
+
+
+@pytest.mark.parametrize(
+    "cfg,field",
+    [
+        ({"enabled": "yes", "recool_temp": 5.0, "confirm_seconds": 600}, "recooling.enabled"),
+        ({"enabled": True, "recool_temp": 8.0, "confirm_seconds": 600}, "recooling.recool_temp"),
+        ({"enabled": True, "recool_temp": 9.0, "confirm_seconds": 600}, "recooling.recool_temp"),
+        ({"enabled": True, "recool_temp": 5.0, "confirm_seconds": 0}, "recooling.confirm_seconds"),
+        ({"enabled": True, "recool_temp": 5.0}, "recooling.confirm_seconds"),
+        ({"enabled": True, "confirm_seconds": 600}, "recooling.recool_temp"),
+    ],
+)
+def test_bad_recooling_config_rejected(cfg, field):
+    with pytest.raises(ThermalValidationError) as ei:
+        audit(
+            {
+                "records": recool_records(),
+                "parameters": params(exposure_limit_seconds=400),
+                "recooling": cfg,
+            }
+        )
+    assert ei.value.code == "bad_recooling"
+    assert ei.value.field == field
+
+
+def test_recooling_must_be_object():
+    with pytest.raises(ThermalValidationError) as ei:
+        audit(
+            {
+                "records": recool_records(),
+                "parameters": params(exposure_limit_seconds=400),
+                "recooling": [],
+            }
+        )
+    assert ei.value.code == "bad_recooling"
+
+
+def test_confirm_longer_than_cold_period_candidate_open_at_end():
+    # 末段仍在复冷阈值以下且时长不足：候选以 timeline_end 收尾且不判清零
+    times = [0, 100, 101, 1100]
+    ambs = [25.0, 25.0, 3.0, 3.0]
+    recs = make_records_from_sim(times, ambs, [False] * 4, 4.0, TAU_CLOSED, TAU_OPEN)
+    res = audit(
+        {
+            "records": recs,
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 10000.0},
+        }
+    )
+    assert res["status"] == "pass"
+    cand = res["recooling"]["candidates"][-1]
+    assert cand["outcome"] == "timeline_end"
+    assert cand["reset"] is False
+    assert cand["shortfall_seconds"] > 0
+
+
+def test_cold_before_first_exposure_does_not_start_candidate():
+    # 全程低温（无任何超温）：即使长时间 <=复冷阈值，也不应有轮次或候选
+    times = list(range(0, 2401, 300))
+    ambs = [3.0, 3.5, 4.0, 3.8, 3.2, 3.0, 2.8, 2.5, 2.0]
+    recs = make_records_from_sim(times, ambs, [False] * 9, 4.0, TAU_CLOSED, TAU_OPEN)
+    res = audit(
+        {
+            "records": recs,
+            "parameters": params(),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 100.0},
+        }
+    )
+    assert res["status"] == "pass"
+    assert res["recooling"]["rounds"] == []
+    assert res["recooling"]["candidates"] == []
+
+
+def test_reanchor_jump_accumulates_same_round_across_records():
+    # 非自洽记录：段末重锚使两个热分量被记录点处的短暂停隔开，
+    # 累计不得被割裂成两轮。
+    recs = [
+        {"time": 0, "box_temp": 4.0, "ambient_temp": 25.0, "lid_open": False},
+        {"time": 500, "box_temp": 6.0, "ambient_temp": 3.0, "lid_open": False},
+        {"time": 520, "box_temp": 12.0, "ambient_temp": 25.0, "lid_open": False},
+        {"time": 1000, "box_temp": 20.0, "ambient_temp": 25.0, "lid_open": False},
+    ]
+    res = audit(
+        {
+            "records": recs,
+            "parameters": params(exposure_limit_seconds=400),
+            "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 600.0},
+        }
+    )
+    assert res["status"] == "reject"
+    # 两个超温连通分量（中间记录点有 20s 间隙）却同属一轮
+    assert len(res["exceedance_intervals"]) == 2
+    assert len(res["recooling"]["rounds"]) == 1
+    ff = res["first_failure_time"]
+    assert ff["round_index"] == 0
+    assert ff["elapsed_seconds"] < 520  # 第一段（430.8s）内即达 400s 限额
+
+

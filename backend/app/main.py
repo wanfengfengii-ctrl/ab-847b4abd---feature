@@ -34,6 +34,13 @@ def audit_schema() -> dict[str, object]:
             "box_temp_limit": "允许箱温阈值（数值，严格超限 T>limit 计暴露）",
             "exposure_limit_seconds": "允许连续暴露时长（秒，>0）",
         },
+        "recooling": {
+            "enabled": "是否启用复冷记忆（布尔，默认 false；不启用时裁决口径与旧版完全一致）",
+            "recool_temp": "复冷阈值（数值，必须严格低于 box_temp_limit）",
+            "confirm_seconds": "连续不高于复冷阈值的确认时长（秒，>0）；达到后清零本轮累计暴露",
+            "rule": "T>限温累计暴露；复冷阈值<T<=限温仅暂停累计并保留记忆；"
+            "连续 T<=复冷阈值 达到确认时长才清零并开始新一轮",
+        },
     }
 
 

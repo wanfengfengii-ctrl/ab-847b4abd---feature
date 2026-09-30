@@ -36,12 +36,42 @@ const PRESETS = {
       { time: 1800, box_temp: 12.912692, ambient_temp: 4, lid_open: false },
     ],
     parameters: { tau_closed: 300, tau_open: 90, box_temp_limit: 8, exposure_limit_seconds: 3600 },
+    recooling: { enabled: false, recool_temp: 5, confirm_seconds: 600 },
+  },
+  recoolReject: {
+    label: "复冷记忆：短暂回落不足确认，后段累计拒收",
+    // tau=300：热相约 137s → 连续 <=5℃ 约 650s → 后段再热；
+    // 限额 400s、确认 700s 时复冷不足，137s 记忆带到后段，累计达 400s 拒收。
+    records: [
+      { time: 0, box_temp: 4.0, ambient_temp: 25, lid_open: false },
+      { time: 100, box_temp: 9.952842, ambient_temp: 25, lid_open: false },
+      { time: 101, box_temp: 9.96629, ambient_temp: 3, lid_open: false },
+      { time: 1100, box_temp: 3.249345, ambient_temp: 3, lid_open: false },
+      { time: 1101, box_temp: 3.285141, ambient_temp: 25, lid_open: false },
+      { time: 1500, box_temp: 19.256914, ambient_temp: 25, lid_open: false },
+    ],
+    parameters: { tau_closed: 300, tau_open: 90, box_temp_limit: 8, exposure_limit_seconds: 400 },
+    recooling: { enabled: true, recool_temp: 5, confirm_seconds: 700 },
+  },
+  recoolPass: {
+    label: "复冷记忆：连续复冷达确认时长，清零放行",
+    records: [
+      { time: 0, box_temp: 4.0, ambient_temp: 25, lid_open: false },
+      { time: 100, box_temp: 9.952842, ambient_temp: 25, lid_open: false },
+      { time: 101, box_temp: 9.96629, ambient_temp: 3, lid_open: false },
+      { time: 1100, box_temp: 3.249345, ambient_temp: 3, lid_open: false },
+      { time: 1101, box_temp: 3.285141, ambient_temp: 25, lid_open: false },
+      { time: 1500, box_temp: 19.256914, ambient_temp: 25, lid_open: false },
+    ],
+    parameters: { tau_closed: 300, tau_open: 90, box_temp_limit: 8, exposure_limit_seconds: 400 },
+    recooling: { enabled: true, recool_temp: 5, confirm_seconds: 600 },
   },
 };
 
 const state = {
   records: structuredClone(PRESETS.reject.records),
   parameters: { ...PRESETS.reject.parameters },
+  recooling: { enabled: false, recool_temp: 5, confirm_seconds: 600 },
   result: null,
   error: null,
   loading: false,
@@ -114,6 +144,23 @@ function renderForm() {
     <div class="hint">约定：相邻记录之间环境温度按<b>线性变化</b>；箱温按一阶模型
       <code>dT/dt=(T_env−T)/τ</code> 逐段闭式求解；箱盖状态在记录时刻切换 τ。</div>
 
+    <h2 style="margin-top:18px">③ 复冷记忆（可选）</h2>
+    <label class="field recool-toggle">
+      <input id="recool_enabled" type="checkbox" ${state.recooling.enabled ? "checked" : ""} />
+      <span>启用「复冷记忆」：短暂回落到限温以下不清零，只有连续不高于复冷阈值达到确认时长才清零</span>
+    </label>
+    <div class="params-grid">
+      <label class="field"><span>复冷阈值（℃，须严格低于允许箱温）</span>
+        <input id="recool_temp" type="number" step="0.1" value="${state.recooling.recool_temp}"
+          ${state.recooling.enabled ? "" : "disabled"} /></label>
+      <label class="field"><span>复冷确认时长（秒，连续不高于阈值）</span>
+        <input id="recool_confirm_seconds" type="number" step="any" value="${state.recooling.confirm_seconds}"
+          ${state.recooling.enabled ? "" : "disabled"} /></label>
+    </div>
+    <div class="hint">未启用时，请求参数、裁决结论与证据口径与原来完全一致。启用后：
+      箱温高于限温累计本轮热暴露；处于复冷阈值与限温之间仅<b>暂停累计并保留记忆</b>；
+      只有<b>连续不高于复冷阈值达到确认时长</b>才清零并开始新一轮。</div>
+
     <div class="btn-row">
       <button class="action" id="submit">提交审计</button>
       <button class="ghost" id="addRow">+ 增加记录</button>
@@ -122,6 +169,10 @@ function renderForm() {
       <button class="ghost" data-preset="reject">拒收演示数据</button>
       <button class="ghost" data-preset="pass">放行演示数据</button>
       <button class="ghost" data-preset="short">短时超温数据</button>
+    </div>
+    <div class="btn-row">
+      <button class="ghost" data-preset="recoolReject">复冷不足→后段拒收</button>
+      <button class="ghost" data-preset="recoolPass">有效复冷→清零放行</button>
     </div>
     ${state.error ? `<div class="error-box">${state.error}</div>` : ""}
   </div>`;
@@ -143,22 +194,37 @@ function collectInputs() {
     box_temp_limit: Number(document.getElementById("box_temp_limit").value),
     exposure_limit_seconds: Number(document.getElementById("exposure_limit_seconds").value),
   };
-  return { recs, params };
+  const recooling = {
+    enabled: document.getElementById("recool_enabled").checked,
+    recool_temp: Number(document.getElementById("recool_temp").value),
+    confirm_seconds: Number(document.getElementById("recool_confirm_seconds").value),
+  };
+  return { recs, params, recooling };
 }
 
 async function submitAudit() {
-  const { recs, params } = collectInputs();
+  const { recs, params, recooling } = collectInputs();
   state.records = recs;
   state.parameters = params;
+  state.recooling = recooling;
   state.loading = true;
   state.error = null;
   state.result = null;
   render();
   try {
+    // 未启用复冷记忆时不传该字段，保证旧请求口径原样；启用才提交阈值与确认时长
+    const reqBody = { records: recs, parameters: params };
+    if (recooling.enabled) {
+      reqBody.recooling = {
+        enabled: true,
+        recool_temp: recooling.recool_temp,
+        confirm_seconds: recooling.confirm_seconds,
+      };
+    }
     const resp = await fetch("/api/audit", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ records: recs, parameters: params }),
+      body: JSON.stringify(reqBody),
     });
     const body = await resp.json();
     if (body.status === "invalid") {
@@ -188,19 +254,40 @@ function renderVerdict(r) {
       <div class="sub">填写记录与参数后点击「提交审计」，服务端将以一阶热响应模型逐段解析求解。</div></div>`;
 
   if (r.status === "pass") {
+    const mem = r.recooling;
+    const memNote =
+      mem && mem.enabled
+        ? `复冷记忆已启用：共 <strong>${mem.rounds.length}</strong> 轮暴露，有效复冷清零 <strong>${
+            mem.rounds.filter((x) => x.reset).length
+          }</strong> 次，复冷候选 <strong>${mem.candidates.length}</strong> 个。<br/>`
+        : "";
     return `<div class="verdict pass"><div class="badge">放 行</div>
-      <div class="sub">箱温连续曲线全程未形成达到 <strong>${fmtDuration(
+      <div class="sub">${memNote}箱温曲线全程未使热暴露累计达到 <strong>${fmtDuration(
         r.parameters.exposure_limit_seconds
-      )}</strong> 的连续超温区间。<br/>
-      累计超温时长 <strong>${fmtDuration(r.total_exceedance_seconds)}</strong>，
-      连续超温区间 <strong>${r.exceedance_intervals.length}</strong> 个。</div></div>`;
+      )}</strong>。<br/>
+      连续超温区间 <strong>${r.exceedance_intervals.length}</strong> 个，
+      超温合计 <strong>${fmtDuration(r.total_exceedance_seconds)}</strong>。</div></div>`;
   }
   const ff = r.first_failure_time;
+  const mem = r.recooling;
+  const memReject = mem && mem.enabled && ff.round_index !== undefined;
+  const memLine = memReject
+    ? `复冷记忆口径：第 <strong>${ff.round_index + 1}</strong> 轮热暴露累计达限额` +
+      (mem.insufficient_recool_at_failure
+        ? `，此前 <strong>第 ${mem.insufficient_recool_at_failure.index + 1} 次复冷不足</strong>` +
+          `（仅连续 ${fmtDuration(
+            mem.insufficient_recool_at_failure.continuous_below_recool_seconds
+          )}，缺口 ${fmtDuration(mem.insufficient_recool_at_failure.shortfall_seconds)}）`
+        : "") +
+      `。<br/>`
+    : "";
   return `<div class="verdict reject"><div class="badge">拒 收</div>
-    <div class="sub">存在连续超温达到 <strong>${fmtDuration(
-      r.parameters.exposure_limit_seconds
-    )}</strong> 的区间，油样自 <strong>${ff.time}</strong>
-    （距首条记录 ${fmtElapsed(ff.elapsed_seconds)}）起失效。<br/>
+    <div class="sub">${memLine}油样自 <strong>${ff.time}</strong>
+    （距首条记录 ${fmtElapsed(ff.elapsed_seconds)}${
+      ff.segment_index !== undefined && ff.segment_index !== null
+        ? `，解析定位在第 ${ff.segment_index + 1} 段`
+        : ""
+    }）起失效。<br/>
     共 ${r.exceedance_intervals.length} 个连续超温区间，累计超温 ${fmtDuration(
     r.total_exceedance_seconds
   )}。</div></div>`;
@@ -209,6 +296,30 @@ function renderVerdict(r) {
 function renderFailureCard(r) {
   if (!r || r.status !== "reject") return "";
   const ff = r.first_failure_time;
+  const mem = r.recooling;
+  if (mem && mem.enabled && ff.round_index !== undefined) {
+    const rd = mem.rounds[ff.round_index];
+    const cited = mem.insufficient_recool_at_failure;
+    return `<div class="failure-card">
+    <h3>复冷记忆 · 首个失效时刻证据</h3>
+    <div class="kv">
+      暴露轮次：<b>第 ${ff.round_index + 1} 轮</b>，起于 <b>${rd.start_time}</b>
+      （${fmtElapsed(rd.elapsed_start_seconds)}）<br/>
+      该轮热暴露累计：<b>${fmtDuration(rd.heat_exposure_seconds)}</b> 达到允许
+      ${fmtDuration(r.parameters.exposure_limit_seconds)}<br/>
+      ${
+        cited
+          ? `此前复冷不足：<b>第 ${cited.index + 1} 次候选</b>（${cited.start_time} → ${cited.end_time}），
+          连续不高于复冷阈值仅 <b>${fmtDuration(cited.continuous_below_recool_seconds)}</b>，
+          距确认时长还差 <b>${fmtDuration(cited.shortfall_seconds)}</b>，
+          中断原因：${cited.outcome_text}<br/>`
+          : ""
+      }
+      首个失效（解析）时刻：<b>${ff.time}</b>（距首条记录 ${fmtElapsed(
+      ff.elapsed_seconds
+    )}，第 ${ff.segment_index + 1} 段）
+    </div></div>`;
+  }
   const iv = r.exceedance_intervals[ff.interval_index];
   return `<div class="failure-card">
     <h3>最早失效时刻证据</h3>
@@ -230,7 +341,10 @@ function buildChart(r) {
   const iw = W - ML - MR, ih = H - MT - MB;
   const curve = r.curve;
   const xmax = curve[curve.length - 1].elapsed_seconds;
-  const allT = curve.flatMap((p) => [p.box_temp, p.ambient_temp]).concat([r.parameters.box_temp_limit]);
+  const allT = curve
+    .flatMap((p) => [p.box_temp, p.ambient_temp])
+    .concat([r.parameters.box_temp_limit])
+    .concat(r.recooling && r.recooling.enabled ? [r.recooling.recool_temp] : []);
   let ymin = Math.min(...allT), ymax = Math.max(...allT);
   const pad = Math.max(1, (ymax - ymin) * 0.08);
   ymin -= pad; ymax += pad;
@@ -286,6 +400,29 @@ function buildChart(r) {
   }
 
   const limit = r.parameters.box_temp_limit;
+  const mem = r.recooling;
+  const memOn = mem && mem.enabled;
+
+  // 复冷候选区间遮罩：绿色=达确认清零，橙红=复冷不足（中断/到记录结束）
+  const recoolRects = memOn
+    ? mem.candidates
+        .map(
+          (ct) =>
+            `<rect x="${X(ct.elapsed_start_seconds)}" y="${MT}" width="${Math.max(
+              1,
+              X(ct.elapsed_end_seconds) - X(ct.elapsed_start_seconds)
+            )}" height="${ih}" fill="${ct.reset ? "#2ecc71" : "#f5a623"}" fill-opacity="${
+              ct.reset ? "0.14" : "0.16"
+            }" />`
+        )
+        .join("")
+    : "";
+
+  const recoolLine = memOn
+    ? `<line x1="${ML}" y1="${Y(mem.recool_temp)}" x2="${W - MR}" y2="${Y(mem.recool_temp)}"
+        stroke="#2ecc71" stroke-width="1.4" stroke-dasharray="2 5"/>
+      <text x="${W - MR}" y="${Y(mem.recool_temp) - 5}" fill="#2ecc71" font-size="11" text-anchor="end">复冷阈值 ${mem.recool_temp}℃</text>`
+    : "";
   const dots = r.records_echo
     .map(
       (rec) =>
@@ -304,10 +441,11 @@ function buildChart(r) {
     : "";
 
   return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="箱温连续曲线">
-    ${lid}${hotRects}
+    ${lid}${recoolRects}${hotRects}
     ${yTicks.join("")}${xTicks.join("")}
     <line x1="${ML}" y1="${Y(limit)}" x2="${W - MR}" y2="${Y(limit)}" stroke="#f5a623" stroke-width="1.6" stroke-dasharray="8 4"/>
     <text x="${W - MR}" y="${Y(limit) - 5}" fill="#f5a623" font-size="11" text-anchor="end">允许箱温 ${limit}℃</text>
+    ${recoolLine}
     <path d="${path("ambient_temp")}" fill="none" stroke="#7d8fa1" stroke-width="1.6" stroke-dasharray="3 3"/>
     <path d="${path("box_temp")}" fill="none" stroke="#4da3ff" stroke-width="2.4"/>
     ${dots}${ffLine}
@@ -319,6 +457,8 @@ function buildChart(r) {
     <span class="swatch"><i style="background:#4da3ff"></i>箱温连续曲线（闭式解析解）</span>
     <span class="swatch"><i style="background:#7d8fa1"></i>环境温（段间线性）</span>
     <span class="swatch"><i style="background:#f5a623"></i>允许箱温</span>
+    ${memOn ? '<span class="swatch"><i style="background:#2ecc71"></i>复冷阈值 / 有效复冷候选</span>' : ""}
+    ${memOn ? '<span class="swatch"><i style="background:#f5a623"></i>复冷不足候选（中断）</span>' : ""}
     <span class="swatch"><i style="background:var(--hot);border:1px solid #ff5d5d"></i>连续超温区间</span>
     <span class="swatch"><i style="background:var(--lid);border:1px solid #f5a623"></i>箱盖开启时段</span>
     <span class="swatch">◦ 空心圆点为录入的箱温读数</span>
@@ -344,17 +484,23 @@ function renderIntervals(r) {
 }
 
 function renderSegments(r) {
+  const memOn = r.recooling && r.recooling.enabled;
   return `<table class="data">
     <thead><tr>
       <th>#</th><th>段起→止(s)</th><th>箱盖</th><th class="num">τ(秒)</th>
       <th class="num">段内最高℃</th><th>最高位置</th>
-      <th class="num">段内最低℃</th><th>穿越(相对秒)</th>
+      <th class="num">段内最低℃</th><th>限温穿越(相对秒)</th>${memOn ? "<th>复冷阈值穿越(相对秒)</th>" : ""}
     </tr></thead>
     <tbody>${r.segments
       .map((s) => {
         const cross = s.crossings
           .map((c) => `<span class="${c.direction}">${c.direction === "up" ? "↑上穿" : "↓下穿"}@${c.elapsed_seconds.toFixed(1)}</span>`)
           .join("，");
+        const rcross = memOn
+          ? (s.recool_crossings || [])
+              .map((c) => `<span class="${c.direction === "up" ? "recool-up" : "recool-down"}">${c.direction === "up" ? "↑上穿" : "↓下穿"}@${c.elapsed_seconds.toFixed(1)}</span>`)
+              .join("，") || "—"
+          : "";
         return `<tr>
         <td>${s.index + 1}</td>
         <td>${s.elapsed_start_seconds} → ${s.elapsed_end_seconds}<br/><span class="hint" style="margin:0">${s.duration_seconds.toFixed(0)}s</span></td>
@@ -363,10 +509,56 @@ function renderSegments(r) {
         <td class="num">${fmtTemp(s.max_temp.value)}</td>
         <td>${s.max_temp.kind === "interior" ? "段内 " + s.max_temp.elapsed_seconds.toFixed(1) + "s" : s.max_temp.kind === "start" ? "段起点" : "段终点"}</td>
         <td class="num">${fmtTemp(s.min_temp.value)}</td>
-        <td>${cross || "—"}</td>
+        <td>${cross || "—"}</td>${memOn ? `<td>${rcross}</td>` : ""}
       </tr>`;
       })
       .join("")}</tbody></table>`;
+}
+
+function renderRecooling(r) {
+  const mem = r.recooling;
+  if (!mem || !mem.enabled) return "";
+  const roundsTable = `<table class="data">
+    <thead><tr><th>轮次</th><th>起始时刻</th><th>结束时刻</th><th class="num">热暴露累计(秒)</th><th>清零/结束原因</th></tr></thead>
+    <tbody>${mem.rounds
+      .map(
+        (rd) => `<tr>
+        <td>第 ${rd.index + 1} 轮</td>
+        <td>${rd.start_time}<br/><span class="hint" style="margin:0">${fmtElapsed(rd.elapsed_start_seconds)}</span></td>
+        <td>${rd.end_time}<br/><span class="hint" style="margin:0">${fmtElapsed(rd.elapsed_end_seconds)}</span></td>
+        <td class="num">${rd.heat_exposure_seconds.toFixed(1)}</td>
+        <td><span class="tag ${rd.reset ? "yes" : rd.end_reason === "failure" ? "yes" : "no"}">${rd.reset ? "已清零" : "未清零"}</span>
+          ${rd.end_reason_text}</td>
+      </tr>`
+      )
+      .join("")}</tbody></table>`;
+  const candTable = mem.candidates.length
+    ? `<table class="data">
+      <thead><tr><th>#</th><th>所属轮</th><th>候选区间(起→止)</th>
+        <th class="num">连续不高于复冷阈值(秒)</th><th class="num">确认要求(秒)</th>
+        <th class="num">缺口(秒)</th><th>结果 / 中断原因</th></tr></thead>
+      <tbody>${mem.candidates
+        .map(
+          (ct) => `<tr>
+        <td>${ct.index + 1}</td>
+        <td>第 ${ct.round_index + 1} 轮</td>
+        <td>${ct.start_time} → ${ct.end_time}<br/><span class="hint" style="margin:0">${fmtElapsed(
+            ct.elapsed_start_seconds
+          )} → ${fmtElapsed(ct.elapsed_end_seconds)}</span></td>
+        <td class="num">${ct.continuous_below_recool_seconds.toFixed(1)}</td>
+        <td class="num">${ct.required_confirm_seconds.toFixed(0)}</td>
+        <td class="num">${ct.shortfall_seconds.toFixed(1)}</td>
+        <td><span class="tag ${ct.reset ? "yes" : "no"}">${ct.reset ? "确认达成→清零" : "复冷不足"}</span>
+          ${ct.outcome_text}</td>
+      </tr>`
+        )
+        .join("")}</tbody></table>`
+    : `<div class="hint">无复冷候选区间（箱温未回落至复冷阈值 ${mem.recool_temp}℃ 以下）。</div>`;
+  return `
+  <div class="section-title">复冷记忆 · 各轮起止与热暴露累计</div>
+  ${roundsTable}
+  <div class="section-title">复冷候选区间（连续不高于复冷阈值的确认情况）</div>
+  ${candTable}`;
 }
 
 function renderResult(r) {
@@ -382,6 +574,7 @@ function renderResult(r) {
 
   <div class="section-title">累计连续超温区间（跨记录取并集）</div>
   ${renderIntervals(r)}
+  ${renderRecooling(r)}
 
   <div class="section-title">各段解析极值与阈值穿越</div>
   ${renderSegments(r)}`;
@@ -405,21 +598,27 @@ function render() {
 
 function bind() {
   document.getElementById("submit")?.addEventListener("click", submitAudit);
+  document.getElementById("recool_enabled")?.addEventListener("change", (e) => {
+    // 勾选状态写回 state 后重绘（控制两个复冷输入框的 disabled）
+    const { recooling } = collectInputs();
+    state.recooling = recooling;
+    render();
+  });
   document.getElementById("addRow")?.addEventListener("click", () => {
-    const { recs, params } = collectInputs();
+    const { recs, params, recooling } = collectInputs();
     if (recs.length >= 30) return;
     const last = recs[recs.length - 1];
     recs.push({
       time: typeof last.time === "number" ? last.time + 600 : last.time,
       box_temp: last.box_temp, ambient_temp: last.ambient_temp, lid_open: false,
     });
-    state.records = recs; state.parameters = params; render();
+    state.records = recs; state.parameters = params; state.recooling = recooling; render();
   });
   document.querySelectorAll("[data-del]").forEach((b) =>
     b.addEventListener("click", () => {
-      const { recs, params } = collectInputs();
+      const { recs, params, recooling } = collectInputs();
       recs.splice(Number(b.dataset.del), 1);
-      state.records = recs; state.parameters = params; render();
+      state.records = recs; state.parameters = params; state.recooling = recooling; render();
     })
   );
   document.querySelectorAll("[data-preset]").forEach((b) => {
@@ -427,6 +626,9 @@ function bind() {
       const pre = PRESETS[b.dataset.preset];
       state.records = structuredClone(pre.records);
       state.parameters = { ...pre.parameters };
+      state.recooling = pre.recooling
+        ? { ...pre.recooling }
+        : { enabled: false, recool_temp: 5, confirm_seconds: 600 };
       state.result = null; state.error = null; render();
     });
   });

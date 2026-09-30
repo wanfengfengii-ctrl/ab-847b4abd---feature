@@ -141,6 +141,23 @@ table.data td.num, table.data th.num { text-align: right; font-variant-numeric: 
 .tag.no { background: rgba(147,164,161,0.15); color: var(--muted); }
 .up { color: var(--reject); }
 .down { color: var(--pass); }
+.recool-up { color: var(--invalid); }
+.recool-down { color: var(--pass); }
+
+label.recool-toggle {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  background: var(--panel-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  cursor: pointer;
+}
+label.recool-toggle input { width: auto; margin-top: 2px; flex: none; }
+label.recool-toggle span { color: var(--text); font-size: 12.5px; line-height: 1.5; margin: 0; }
+input:disabled { opacity: 0.45; }
 
 .error-box {
   background: rgba(245, 166, 35, 0.08); border: 1px solid var(--invalid);

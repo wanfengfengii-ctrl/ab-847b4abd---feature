@@ -121,3 +121,78 @@ def test_iso_time_payload():
     r = client.post("/api/audit", json={"records": recs, "parameters": PARAMS})
     assert r.status_code == 200
     assert isinstance(r.json()["records_echo"][0]["time"], str)
+
+
+# ---------- 复冷记忆 ----------
+
+RECOOL_PARAMS = {**PARAMS, "exposure_limit_seconds": 400}
+RECOOL_RECORDS = make_records_from_sim(
+    [0, 100, 101, 1100, 1101, 1500],
+    [25.0, 25.0, 3.0, 3.0, 25.0, 25.0],
+    [False] * 6,
+    4.0,
+    300.0,
+    90.0,
+)
+
+
+def test_recooling_absent_is_legacy_shape():
+    r = client.post("/api/audit", json={"records": RECOOL_RECORDS, "parameters": RECOOL_PARAMS})
+    body = r.json()
+    assert "recooling" not in body
+
+
+def test_recooling_effective_reset_passes():
+    payload = {
+        "records": RECOOL_RECORDS,
+        "parameters": RECOOL_PARAMS,
+        "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 600.0},
+    }
+    r = client.post("/api/audit", json=payload)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["status"] == "pass"
+    assert body["first_failure_time"] is None
+    blk = body["recooling"]
+    assert blk["enabled"] is True
+    assert {rd["end_reason"] for rd in blk["rounds"]} == {"recool_confirmed", "timeline_end"}
+    assert blk["insufficient_recool_at_failure"] is None
+
+
+def test_recooling_insufficient_rejects_with_evidence():
+    payload = {
+        "records": RECOOL_RECORDS,
+        "parameters": RECOOL_PARAMS,
+        "recooling": {"enabled": True, "recool_temp": 5.0, "confirm_seconds": 700.0},
+    }
+    r = client.post("/api/audit", json=payload)
+    body = r.json()
+    assert body["status"] == "reject"
+    ff = body["first_failure_time"]
+    assert ff["round_index"] == 0
+    assert ff["segment_index"] == 4
+    cited = body["recooling"]["insufficient_recool_at_failure"]
+    assert cited["outcome"] == "rewarm_above_recool"
+    assert cited["shortfall_seconds"] > 0
+    # 指明失效发生的解析时刻与不足复冷候选
+    assert ff["elapsed_seconds"] > cited["elapsed_end_seconds"]
+
+
+def test_recooling_bad_config_422():
+    payload = {
+        "records": RECOOL_RECORDS,
+        "parameters": RECOOL_PARAMS,
+        "recooling": {"enabled": True, "recool_temp": 9.0, "confirm_seconds": 600},
+    }
+    r = client.post("/api/audit", json=payload)
+    assert r.status_code == 422
+    err = r.json()["errors"][0]
+    assert err["code"] == "bad_recooling"
+    assert err["field"] == "recooling.recool_temp"
+
+
+def test_recooling_schema_documents_fields():
+    r = client.get("/api/audit/schema")
+    rc = r.json()["recooling"]
+    assert "recool_temp" in rc and "confirm_seconds" in rc
+
